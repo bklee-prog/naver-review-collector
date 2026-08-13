@@ -37,6 +37,7 @@ jobs:
           APPS_SCRIPT_WEBAPP_URL: ${{ secrets.APPS_SCRIPT_WEBAPP_URL }}
           INBOUND_TOKEN: ${{ secrets.INBOUND_TOKEN }}
           LATEST_LIMIT: "200"
+          LATEST_RESCAN_LIMIT: "100"
           RECOMMEND_LIMIT: "50"
         run: python collector.py
 
