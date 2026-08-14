@@ -46,6 +46,7 @@ jobs:
           LATEST_LIMIT: "200"
           LATEST_RESCAN_LIMIT: "100"
           RECOMMEND_LIMIT: "50"
+          PYTHONUNBUFFERED: "1"
         run: python collector.py
 
       # If Naver changes its DOM, these files let us inspect the exact rendered page.
