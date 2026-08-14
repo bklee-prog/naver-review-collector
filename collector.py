@@ -17,7 +17,7 @@ LATEST_LIMIT = int(os.getenv("LATEST_LIMIT", "200"))
 LATEST_RESCAN_LIMIT = int(os.getenv("LATEST_RESCAN_LIMIT", "100"))
 RECOMMEND_LIMIT = int(os.getenv("RECOMMEND_LIMIT", "50"))
 
-COLLECTOR_VERSION = "v10.0"
+COLLECTOR_VERSION = "v11.0"
 
 DEBUG_DIR = Path("debug")
 DEBUG_DIR.mkdir(exist_ok=True)
@@ -394,33 +394,41 @@ class NaverReviewCrawler:
         return None
 
     def generic_cards(self, page):
-        # Find likely review cards without depending on Naver's minified class names.
-        # Review cards are commonly LI elements containing time/profile/follow/review text.
+        # Naver가 LI 대신 role=listitem/article/div 구조를 내보내는 경우까지 대응.
         try:
-            candidates = page.locator("li")
+            candidates = page.locator("li, [role='listitem'], article")
             accepted = []
+            seen = set()
 
-            for i in range(min(candidates.count(), 500)):
-                li = candidates.nth(i)
+            for i in range(min(candidates.count(), 700)):
+                elem = candidates.nth(i)
+
                 try:
-                    text = normalize_text(safe_text(li, timeout=500))
-                    if len(text) < 15:
-                        continue
-                    if len(text) > 5000:
+                    text = normalize_text(safe_text(elem, timeout=500))
+
+                    if len(text) < 15 or len(text) > 5000:
                         continue
 
-                    has_time = li.locator("time").count() > 0
+                    has_time = elem.locator("time").count() > 0
                     has_profile_signal = (
                         "팔로우" in text
-                        or "리뷰" in text
+                        or "번째 방문" in text
+                        or "영수증" in text
                         or has_time
                     )
 
-                    # Avoid nav/menu list items.
-                    if has_profile_signal and not (
-                        text in ("소식", "예약", "전시", "리뷰", "사진", "정보")
-                    ):
-                        accepted.append(li)
+                    if not has_profile_signal:
+                        continue
+
+                    if text in ("소식", "예약", "전시", "리뷰", "사진", "정보"):
+                        continue
+
+                    sig = text[:220]
+                    if sig in seen:
+                        continue
+
+                    seen.add(sig)
+                    accepted.append(elem)
                 except Exception:
                     continue
 
@@ -523,6 +531,117 @@ class NaverReviewCrawler:
             "rank": rank,
         }
 
+    def content_parent_cards(self, page):
+        """
+        Known card selector가 바뀌어도 리뷰 본문/메타데이터 요소에서
+        가장 가까운 카드 컨테이너를 역으로 찾는 보조 탐색.
+        """
+        found = []
+        seen_handles = set()
+
+        selectors = [
+            "[class*='pui__vn15t2']",
+            "[class*='pui__NMi']",
+            "time",
+            "[role='listitem']",
+        ]
+
+        for selector in selectors:
+            try:
+                loc = page.locator(selector)
+                count = min(loc.count(), 300)
+            except Exception:
+                continue
+
+            for i in range(count):
+                node = loc.nth(i)
+
+                try:
+                    card = node.locator(
+                        "xpath=ancestor-or-self::*[self::li or @role='listitem' or self::article][1]"
+                    )
+
+                    if card.count() == 0:
+                        # 최근순 페이지에서 li 구조가 사라진 변형 DOM 대응.
+                        # 현재 노드에서 위로 올라가며 리뷰 카드 크기의 컨테이너를 찾는다.
+                        card = node.locator(
+                            "xpath=ancestor::div[string-length(normalize-space(.)) >= 25 "
+                            "and string-length(normalize-space(.)) <= 5000][1]"
+                        )
+
+                    if card.count() == 0:
+                        continue
+
+                    card = card.first
+                    txt = normalize_text(safe_text(card, timeout=700))
+
+                    if len(txt) < 20 or len(txt) > 5000:
+                        continue
+
+                    # 리뷰 카드에서 자주 보이는 신호.
+                    signals = (
+                        "팔로우" in txt
+                        or "번째 방문" in txt
+                        or "영수증" in txt
+                        or card.locator("time").count() > 0
+                    )
+                    if not signals:
+                        continue
+
+                    # Locator 객체 자체는 hash 불가이므로 텍스트 앞부분으로 1차 중복 제거.
+                    signature = txt[:220]
+                    if signature in seen_handles:
+                        continue
+
+                    seen_handles.add(signature)
+                    found.append(card)
+                except Exception:
+                    continue
+
+        return found
+
+    def get_cards(self, page):
+        """
+        1) 네이버의 알려진 selector
+        2) 본문/작성자/time에서 부모 카드 역추적
+        3) 일반 li/role=listitem/article 휴리스틱
+        순으로 탐색한다.
+        """
+        known = self.known_cards(page)
+        if known is not None:
+            try:
+                count = known.count()
+                if count > 0:
+                    return [known.nth(i) for i in range(count)], "known"
+            except Exception:
+                pass
+
+        parents = self.content_parent_cards(page)
+        if parents:
+            return parents, "parent-fallback"
+
+        generic = self.generic_cards(page)
+        if generic:
+            return generic, "generic"
+
+        return [], "none"
+
+    def wait_for_cards(self, page, timeout_ms=14000):
+        """
+        정렬 클릭/직접 URL 이동 직후 SPA가 늦게 렌더링되는 경우를 기다린다.
+        """
+        deadline = time.time() + (timeout_ms / 1000)
+
+        while time.time() < deadline:
+            cards, mode = self.get_cards(page)
+
+            if cards:
+                return cards, mode
+
+            page.wait_for_timeout(700)
+
+        return [], "none"
+
     def click_more(self, page):
         for selector in MORE_SELECTORS:
             try:
@@ -563,9 +682,17 @@ class NaverReviewCrawler:
 
         try:
             review_url = self.direct_review_url(place_id)
-            print(f"OPEN DIRECT REVIEW: {review_url}")
-            page.goto(review_url, wait_until="domcontentloaded", timeout=45000)
-            page.wait_for_timeout(3500)
+
+            # 최신순은 정렬 버튼 클릭보다 query URL 직접 진입을 우선한다.
+            # 코스믹 리조트에서 SPA 정렬 전환 후 카드가 0개로 보이는 현상을 우회.
+            if sort_type == "LATEST":
+                target_url = review_url + "?reviewSort=recent"
+            else:
+                target_url = review_url
+
+            print(f"OPEN REVIEW: {target_url}")
+            page.goto(target_url, wait_until="domcontentloaded", timeout=45000)
+            page.wait_for_timeout(4500)
 
             if not self.wait_for_review_page(page, place_name):
                 raise RuntimeError(
@@ -573,7 +700,33 @@ class NaverReviewCrawler:
                     f"target={page.url}"
                 )
 
-            self.click_sort(page, sort_type)
+            # 첫 렌더링에서 카드가 늦게 붙는 경우 대기.
+            first_cards, first_mode = self.wait_for_cards(page, timeout_ms=14000)
+
+            # 최신순 직접 URL에서 여전히 0개면 base URL로 돌아가 버튼 클릭 방식까지 재시도.
+            if sort_type == "LATEST" and not first_cards:
+                print("LATEST direct recent URL had 0 cards -> fallback to base + click 최신순")
+                page.goto(review_url, wait_until="domcontentloaded", timeout=45000)
+                page.wait_for_timeout(4000)
+
+                if not self.wait_for_review_page(page, place_name):
+                    raise RuntimeError(
+                        "리뷰 페이지 텍스트가 준비되지 않았습니다. "
+                        f"target={page.url}"
+                    )
+
+                clicked = self.click_sort(page, sort_type)
+                print("LATEST sort click fallback:", clicked)
+                page.wait_for_timeout(3500)
+                first_cards, first_mode = self.wait_for_cards(page, timeout_ms=14000)
+
+            elif sort_type == "RECOMMEND":
+                # 추천순은 base URL이 보통 기본값이지만, 필요하면 버튼 클릭으로 한번 보정.
+                if not first_cards:
+                    clicked = self.click_sort(page, sort_type)
+                    print("RECOMMEND sort click fallback:", clicked)
+                    page.wait_for_timeout(3000)
+                    first_cards, first_mode = self.wait_for_cards(page, timeout_ms=12000)
 
             results = []
             seen = set()
@@ -581,18 +734,15 @@ class NaverReviewCrawler:
             stagnant = 0
 
             for loop in range(70):
-                known = self.known_cards(page)
-
-                if known is not None:
-                    elements = [known.nth(i) for i in range(known.count())]
-                    mode = "known"
+                if loop == 0 and first_cards:
+                    elements = first_cards
+                    mode = first_mode
                 else:
-                    elements = self.generic_cards(page)
-                    mode = "generic"
+                    elements, mode = self.get_cards(page)
 
                 print(
                     f"{sort_type} loop={loop+1} mode={mode} "
-                    f"cards={len(elements)} collected={len(results)}"
+                    f"cards={len(elements)} collected={len(results)} url={page.url}"
                 )
 
                 before = len(results)
@@ -604,11 +754,15 @@ class NaverReviewCrawler:
                         break
 
                     try:
-                        review = (
-                            self.extract_known(elem, len(results) + 1)
-                            if mode == "known"
-                            else self.extract_generic(elem, len(results) + 1)
-                        )
+                        # parent-fallback 카드도 known selector를 먼저 적용하고,
+                        # 내용이 비면 generic 방식으로 한번 더 시도.
+                        if mode in ("known", "parent-fallback"):
+                            review = self.extract_known(elem, len(results) + 1)
+
+                            if not review["content"]:
+                                review = self.extract_generic(elem, len(results) + 1)
+                        else:
+                            review = self.extract_generic(elem, len(results) + 1)
                     except Exception:
                         continue
 
@@ -617,10 +771,8 @@ class NaverReviewCrawler:
 
                     rid = review["id"]
 
-                    # LATEST도 기존 REVIEW_ID를 만났다고 중단하지 않는다.
-                    # 매일 최신순 상위 N건을 끝까지 다시 훑고,
-                    # Apps Script에서 REVIEW_ID 기준으로 중복 제거한다.
-                    # 이렇게 해야 "작성일은 과거인데 오늘 새로 노출된 리뷰"도 놓치지 않는다.
+                    # 매일 최신순 TOP N을 끝까지 다시 확인한다.
+                    # 중복 제거는 Apps Script의 REVIEW_ID + 작성자/내용 기준에서 처리.
                     if rid in seen:
                         continue
 
@@ -643,6 +795,11 @@ class NaverReviewCrawler:
                     "리뷰 페이지는 열렸지만 리뷰 카드 추출 결과가 0개입니다. "
                     f"target={page.url}"
                 )
+
+            print(
+                f"{sort_type} extracted total={len(results)} "
+                f"first_authors={[r.get('author','') for r in results[:5]]}"
+            )
 
             return results[:limit]
 
