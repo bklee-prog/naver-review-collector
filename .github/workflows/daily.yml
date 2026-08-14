@@ -32,6 +32,13 @@ jobs:
       - name: Install Chromium
         run: python -m playwright install --with-deps chromium
 
+      - name: Validate collector entrypoint
+        run: |
+          python -m py_compile collector.py
+          grep -q 'if __name__ == "__main__":' collector.py
+          grep -q 'sys.exit(main())' collector.py
+          echo "collector.py syntax + main entrypoint OK"
+
       - name: Collect Naver reviews
         env:
           APPS_SCRIPT_WEBAPP_URL: ${{ secrets.APPS_SCRIPT_WEBAPP_URL }}
